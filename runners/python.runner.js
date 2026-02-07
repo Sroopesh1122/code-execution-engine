@@ -1,13 +1,12 @@
-const fs = require("fs/promises"); // prefer async
+const fs = require("fs/promises");
 const { execFileSync } = require("child_process");
 const { v4: uuidv4 } = require("uuid");
 const path = require("path");
 
 module.exports = async (studentCode, visibleTests, hiddenTests, options = {}) => {
   const {
-    timeout = 5000,           // increased default
+    timeout = 5000,
     pythonPath = "python3",
-    // New options — Judge0-like
     ignoreTrailingWhitespace = true,
     collapseMultipleSpaces = true,
     normalizeNewlines = true,
@@ -19,10 +18,22 @@ module.exports = async (studentCode, visibleTests, hiddenTests, options = {}) =>
   let passedHidden = 0;
 
   // ────────────────────────────────────────────────
-  //  Judge0-like token-based comparison
+  //  Safe output normalization (Judge0-inspired)
   // ────────────────────────────────────────────────
-  function normalizeOutput(text) {
-    if (!text) return "";
+  function normalizeOutput(output) {
+    // Force to string safely
+    let text = "";
+    if (output != null) {
+      if (typeof output === "string") {
+        text = output;
+      } else if (Buffer.isBuffer(output)) {
+        text = output.toString("utf-8");
+      } else {
+        text = String(output);
+      }
+    }
+
+    if (!text.trim()) return "";
 
     let normalized = text.trim();
 
@@ -35,40 +46,38 @@ module.exports = async (studentCode, visibleTests, hiddenTests, options = {}) =>
     }
 
     if (ignoreTrailingWhitespace) {
-      normalized = normalized.replace(/[ \t]+$/gm, ""); // per line
+      normalized = normalized.replace(/[ \t]+$/gm, "");
     }
 
     return normalized;
   }
 
   function tokenize(text) {
-    // Very simple Judge0-inspired tokenizer:
-    // split on whitespace, keep non-empty tokens
     return normalizeOutput(text)
       .split(/\s+/)
       .filter(Boolean);
   }
 
-  function outputsMatch(actualStdout, expected) {
-    if (floatingPointTolerance) {
-      // Future: implement approximate float comparison per token
-      // For now — fallback to token match
+  function outputsMatch(actualStdout, expectedOutput) {
+    try {
+      const aTokens = tokenize(actualStdout);
+      const eTokens = tokenize(expectedOutput);
+
+      if (aTokens.length !== eTokens.length) return false;
+
+      for (let i = 0; i < aTokens.length; i++) {
+        if (aTokens[i] !== eTokens[i]) return false;
+      }
+
+      return true;
+    } catch (err) {
+      console.error("Output comparison failed:", err);
+      return false;
     }
-
-    const aTokens = tokenize(actualStdout);
-    const eTokens = tokenize(expected);
-
-    if (aTokens.length !== eTokens.length) return false;
-
-    for (let i = 0; i < aTokens.length; i++) {
-      if (aTokens[i] !== eTokens[i]) return false;
-    }
-
-    return true;
   }
 
   // ────────────────────────────────────────────────
-  //  Run one test case — Judge0 style (stdin → stdout)
+  //  Run one test case
   // ────────────────────────────────────────────────
   async function runTest(inputStr, expectedOutputStr, isVisible = false) {
     const tempDir = await fs.mkdtemp(path.join("/tmp", "judge-like-"));
@@ -76,10 +85,8 @@ module.exports = async (studentCode, visibleTests, hiddenTests, options = {}) =>
     const wrapperPath = path.join(tempDir, "run.py");
 
     try {
-      // Student code + simple runner that feeds stdin and captures print()
       const wrapper = `
 import sys
-import json
 
 # ─── Student code ───────────────────────────────────────
 ${studentCode}
@@ -87,40 +94,48 @@ ${studentCode}
 # ─── Runner ─────────────────────────────────────────────
 try:
     input_data = sys.stdin.read().rstrip('\\n')
-    # If student defined solution(), call it with raw input
-    if 'solution' in globals():
+    if 'solution' in globals() and callable(solution):
         result = solution(input_data)
         if result is not None:
-            print(result)
-    else:
-        # Otherwise just exec the whole code (classic script style)
-        pass  # already executed
-
+            if isinstance(result, (list, dict, tuple)):
+                print(str(result))
+            else:
+                print(result)
+    # If no solution() function → assume classic script style
 except Exception as e:
-    print("Runtime Error:", str(e), file=sys.stderr)
+    print("RUNTIME_ERROR:", str(e), file=sys.stderr)
     sys.exit(1)
 `;
 
-      await fs.writeFile(codePath, studentCode);       // for syntax check later
+      await fs.writeFile(codePath, studentCode);
       await fs.writeFile(wrapperPath, wrapper);
 
-      // Execute
       const child = execFileSync(
         pythonPath,
         [wrapperPath],
         {
-          input: inputStr + "\n",           // Judge0-like: raw string + newline
+          input: String(inputStr) + "\n",
           timeout,
           encoding: "utf-8",
           stdio: ["pipe", "pipe", "pipe"],
-          maxBuffer: 1024 * 1024 * 5,       // 5 MB limit
+          maxBuffer: 1024 * 1024 * 10, // 10 MB
         }
       );
 
-      const stdout = child.stdout || "";
-      const stderr = child.stderr || "";
+      let stdout = child.stdout || "";
+      let stderr = child.stderr || "";
+
+      // Clean up possible prefix from wrapper
+      stderr = stderr.replace(/^RUNTIME_ERROR:\s*/i, "");
 
       const passed = outputsMatch(stdout, expectedOutputStr);
+
+      let verdict = "Wrong Answer";
+      if (passed) {
+        verdict = "Accepted";
+      } else if (stderr.includes("RUNTIME_ERROR") || stderr.trim()) {
+        verdict = "Runtime Error";
+      }
 
       return {
         input: inputStr,
@@ -128,50 +143,57 @@ except Exception as e:
         stdout: stdout.trim(),
         stderr: stderr.trim(),
         passed,
-        verdict: passed          ? "Accepted" :
-                 stderr.includes("Error") ? "Runtime Error" :
-                 "Wrong Answer",
-        time: "N/A (sync exec)", // can measure if needed
+        verdict,
+        time: "N/A (sync)",
       };
-
     } catch (err) {
       let verdict = "Runtime Error";
-      let message = err.message;
+      let stderrContent = err.stderr || err.message || "";
 
-      if (err.status === 124) verdict = "Time Limit Exceeded"; // timeout
-      if (err.code === "ERR_CHILD_PROCESS_TIMEOUT") verdict = "Time Limit Exceeded";
+      if (err.code === "ERR_CHILD_PROCESS_TIMEOUT" || err.status === 124) {
+        verdict = "Time Limit Exceeded";
+      }
 
       return {
         input: inputStr,
         expected: expectedOutputStr,
         stdout: "",
-        stderr: err.stderr || message,
+        stderr: stderrContent.trim(),
         passed: false,
         verdict,
       };
     } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
   // ────────────────────────────────────────────────
-  //  Syntax check (keep similar)
+  //  Syntax / Compilation check
   // ────────────────────────────────────────────────
+  let compilationError = null;
   try {
     const tempCheck = path.join("/tmp", `check_${uuidv4()}.py`);
     await fs.writeFile(tempCheck, studentCode);
-    execFileSync(pythonPath, ["-m", "py_compile", tempCheck], { timeout: 2000 });
-    await fs.unlink(tempCheck);
+    execFileSync(pythonPath, ["-m", "py_compile", tempCheck], { timeout: 3000 });
+    await fs.unlink(tempCheck).catch(() => {});
   } catch (err) {
+    compilationError = err.message.includes("SyntaxError")
+      ? "Syntax Error"
+      : err.message || "Compilation failed";
     return {
-      compilationError: err.message.includes("SyntaxError") ? "Syntax Error" : err.message,
+      compilationError,
       results: null,
-      summary: { passed: 0, total: 0, percentage: "0%" }
+      summary: {
+        passed: 0,
+        total: 0,
+        percentage: "0.0%",
+        verdicts: { compilation_error: 1 }
+      }
     };
   }
 
   // ────────────────────────────────────────────────
-  //  Run tests
+  //  Execute visible + hidden tests
   // ────────────────────────────────────────────────
   for (const t of visibleTests) {
     const r = await runTest(t.input, t.output, true);
@@ -188,6 +210,15 @@ except Exception as e:
   const total = visibleTests.length + hiddenTests.length;
   const passed = passedVisible + passedHidden;
 
+  // Count verdict types
+  const allResults = [...results.visible, ...results.hidden];
+  const verdictCounts = {
+    accepted: allResults.filter(r => r.verdict === "Accepted").length,
+    wrong_answer: allResults.filter(r => r.verdict === "Wrong Answer").length,
+    runtime_error: allResults.filter(r => r.verdict === "Runtime Error").length,
+    time_limit_exceeded: allResults.filter(r => r.verdict === "Time Limit Exceeded").length,
+  };
+
   return {
     compilationError: null,
     results,
@@ -198,12 +229,8 @@ except Exception as e:
       totalHidden: hiddenTests.length,
       passed,
       total,
-      percentage: total > 0 ? ((passed / total) * 100).toFixed(1) + "%" : "0%",
-      verdicts: {
-        accepted: passed,
-        wrong_answer: total - passed,
-        // can count TLE, RE, etc. from results
-      }
+      percentage: total > 0 ? ((passed / total) * 100).toFixed(1) + "%" : "0.0%",
+      verdicts: verdictCounts
     }
   };
 };
